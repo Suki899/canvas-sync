@@ -78,7 +78,8 @@ class Client:
                     raise SyncError("Canvas returned a redirect without a destination.")
                 url = urljoin(url, location)
                 continue
-            if response.status_code == 401:
+            # Only Canvas saw the token; a 401 from a file host is an expired link.
+            if response.status_code == 401 and same_site:
                 response.close()
                 raise AuthenticationError("Canvas rejected your token. Run again with --login.")
             if response.status_code in (403, 404):

@@ -109,9 +109,21 @@ def parser():
     return result
 
 
+class Stopped(BaseException):
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def stop(signum, _frame):
+    # Raise rather than set a flag, so a pass that is mid-download stops too.
+    # Downloads go to temporary files, so nothing is left half-written.
+    raise Stopped(signum)
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
-    stopped = threading.Event()
+    pause = threading.Event()
     previous = {}
     client = None
     try:
@@ -127,9 +139,9 @@ def main(argv=None):
                 atomic_json(account_path, {"token": token})
             if not args.background:
                 for signum in (signal.SIGINT, signal.SIGTERM):
-                    previous[signum] = signal.signal(signum, lambda *_: stopped.set())
+                    previous[signum] = signal.signal(signum, stop)
                 print(f"Mirroring to {root}", flush=True)
-                while not stopped.is_set():
+                while True:
                     try:
                         counts = mirror.run(client)
                         if args.once:
@@ -141,14 +153,16 @@ def main(argv=None):
                         if args.once:
                             return 1
                     print(f"Next sync in {args.interval} seconds. Ctrl+C to stop.", flush=True)
-                    stopped.wait(args.interval)
-                return 0
+                    pause.wait(args.interval)
         # The child must be able to acquire the mirror lock immediately.
         install_service(root, args.interval)
         return 0
     except (SyncError, OSError, EOFError) as exc:
         print(f"canvas-sync: {exc}", file=sys.stderr)
         return 1
+    except Stopped as exc:
+        # SIGTERM is how systemd stops the service; that is not a failure.
+        return 130 if exc.signum == signal.SIGINT else 0
     except KeyboardInterrupt:
         return 130
     finally:

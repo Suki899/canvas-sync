@@ -2,6 +2,7 @@ import copy
 import io
 import os
 from pathlib import Path
+import signal
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -9,7 +10,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from canvas_mirror.api import AuthenticationError, Client, SyncError, UnavailableError, normalize_url
-from canvas_mirror.cli import main, install_service
+from canvas_mirror.cli import Stopped, main, install_service
 from canvas_mirror.storage import mirror_lock
 from canvas_mirror.sync import Mirror
 
@@ -48,6 +49,7 @@ class FakeClient:
         self.body = b"abc"
         self.broken = False
         self.failure = None
+        self.unavailable = set()
         self.downloads = 0
 
     def listing(self, path):
@@ -61,6 +63,8 @@ class FakeClient:
 
     def get(self, url, download=False):
         self.downloads += 1
+        if url in self.unavailable:
+            raise UnavailableError("denied")
         return Response(body=self.body, broken=self.broken)
 
 
@@ -119,6 +123,48 @@ class MirrorTests(unittest.TestCase):
         self.client.files = []
         self.assertEqual(self.run_sync()["removed"], 1)
         self.assertFalse(new.exists())
+
+    def test_remote_name_swap_updates_both_files(self):
+        self.client.files.append({"id": 21, "folder_id": 11, "display_name": "other.pdf", "updated_at": "1", "size": 3, "url": "https://cdn.example/other"})
+        self.run_sync()
+        other = self.dest.with_name("other.pdf")
+        self.client.files[0]["display_name"], self.client.files[1]["display_name"] = "other.pdf", "week.pdf"
+        self.client.body = b"new"
+        counts = self.run_sync()
+        self.assertEqual((counts["downloaded"], counts["protected"]), (2, 0))
+        self.assertEqual(self.dest.read_bytes(), b"new")
+        self.assertEqual(other.read_bytes(), b"new")
+        self.assertEqual(self.run_sync()["unchanged"], 2)
+
+    def test_reupload_under_same_name_replaces_file_in_one_pass(self):
+        self.run_sync()
+        self.client.files[0]["id"] = 22
+        self.client.body = b"new"
+        counts = self.run_sync()
+        self.assertEqual((counts["downloaded"], counts["protected"], counts["removed"]), (1, 0, 0))
+        self.assertEqual(self.dest.read_bytes(), b"new")
+        self.assertEqual(list(self.mirror.state["files"]), ["1:22"])
+
+    def test_reupload_keeps_edited_copy_at_same_name(self):
+        self.run_sync()
+        self.dest.write_bytes(b"my notes")
+        self.client.files[0]["id"] = 22
+        self.assertEqual(self.run_sync()["protected"], 2)
+        self.assertEqual(self.dest.read_bytes(), b"my notes")
+
+    def test_failed_download_does_not_block_rest_of_course(self):
+        self.run_sync()
+        self.client.files = [{"id": 30, "folder_id": 11, "display_name": "broken.pdf", "updated_at": "1", "size": 3, "url": "https://cdn.example/broken"},
+                             {"id": 31, "folder_id": 11, "display_name": "fine.pdf", "updated_at": "1", "size": 3, "url": "https://cdn.example/fine"}]
+        self.client.unavailable.add("https://cdn.example/broken")
+        counts = self.run_sync()
+        self.assertEqual((counts["errors"], counts["downloaded"], counts["removed"]), (1, 1, 0))
+        self.assertTrue(self.dest.with_name("fine.pdf").exists())
+        # A deletion is only trusted once the whole course synced cleanly.
+        self.assertTrue(self.dest.exists())
+        self.client.unavailable.clear()
+        self.assertEqual(self.run_sync()["removed"], 1)
+        self.assertFalse(self.dest.exists())
 
     def test_remote_delete_preserves_edited_copy(self):
         self.run_sync()
@@ -287,6 +333,12 @@ class ApiTests(unittest.TestCase):
             self.client.one("/api/v1/users/self/profile")
         self.assertNotIn("secret-token", str(caught.exception))
 
+    def test_unauthorized_file_host_is_not_a_token_failure(self):
+        self.client.session.get.return_value = Response(status=401)
+        with self.assertRaises(SyncError) as caught:
+            self.client.get("https://cdn.example/download", download=True)
+        self.assertNotIsInstance(caught.exception, AuthenticationError)
+
     def test_pagination_loop_rejected(self):
         url = "https://canvas.example/api/v1/courses?per_page=100"
         self.client.session.get.return_value = Response([], links={"next": {"url": url}})
@@ -322,12 +374,24 @@ class CliTests(unittest.TestCase):
             client = Mock()
             client.one.return_value = {"id": 1}
             event = Mock()
-            event.is_set.side_effect = [False, False, True]
+            event.wait.side_effect = [None, Stopped(signal.SIGTERM)]
             with patch.dict(os.environ, {"XDG_CONFIG_HOME": temp, "CANVAS_URL": "https://canvas.example", "CANVAS_TOKEN": "test"}, clear=True), patch("canvas_mirror.cli.Client", return_value=client), patch("canvas_mirror.cli.threading.Event", return_value=event), patch("canvas_mirror.cli.Mirror.run", side_effect=[SyncError("offline"), {}]) as sync, patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO):
                 self.assertEqual(main([str(Path(temp) / "mirror"), "--interval", "30"]), 0)
                 self.assertEqual(sync.call_count, 2)
                 self.assertEqual(event.wait.call_count, 2)
                 event.wait.assert_called_with(30)
+
+    def test_interrupt_stops_a_running_pass(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = Mock()
+            client.one.return_value = {"id": 1}
+            def interrupted(_client):
+                os.kill(os.getpid(), signal.SIGINT)
+                self.fail("the signal did not stop the pass")
+            with patch.dict(os.environ, {"XDG_CONFIG_HOME": temp, "CANVAS_URL": "https://canvas.example", "CANVAS_TOKEN": "test"}, clear=True), patch("canvas_mirror.cli.Client", return_value=client), patch("canvas_mirror.cli.Mirror.run", side_effect=interrupted), patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(main([str(Path(temp) / "mirror"), "--once"]), 130)
+            self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+            client.close.assert_called_once()
 
     def test_background_releases_lock_before_starting_service(self):
         with tempfile.TemporaryDirectory() as temp:

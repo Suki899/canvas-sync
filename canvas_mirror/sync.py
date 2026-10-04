@@ -122,12 +122,20 @@ class Mirror:
                 break
             directory = directory.parent
 
+    def owner(self, relative, key):
+        """Return another record that this mirror wrote at `relative`, if any."""
+        for other, entry in self.state["files"].items():
+            if other != key and entry["path"] == relative:
+                return other
+        return None
+
     def course(self, client, course, counts):
         course_id = str(int(course["id"]))
         folders = client.listing(f"/api/v1/courses/{course_id}/folders")
         files = client.listing(f"/api/v1/courses/{course_id}/files")
         paths = file_paths(course, folders, files)
         seen = set()
+        failed = False
         for info in files:
             key = f"{course_id}:{int(info['id'])}"
             seen.add(key)
@@ -135,40 +143,64 @@ class Mirror:
                 counts["unavailable"] += 1
                 continue
             relative = str(paths[str(int(info["id"]))])
-            destination = checked_path(self.root, relative)
-            known = self.state["files"].get(key)
-            current = digest(destination)
-            same_path = known and known["path"] == relative
-            if current is not None and (not same_path or current != known["sha256"]):
-                self.report(f"Kept existing/local file: {relative}")
-                counts["protected"] += 1
-                continue
-            stamp = [info.get("updated_at"), info.get("modified_at"), info.get("size")]
-            if same_path and current is not None and known["stamp"] == stamp:
-                counts["unchanged"] += 1
-                continue
-            # Keep a modified old path on a remote rename, and report the conflict.
-            if known and not same_path:
-                old = checked_path(self.root, known["path"])
-                old_hash = digest(old)
-                if old_hash is not None and old_hash != known["sha256"]:
-                    self.report(f"Kept local changes: {known['path']}")
-                    counts["protected"] += 1
-                    continue
-            sha256 = self.fetch(client, info, destination, current)
-            if known and not same_path:
-                old = checked_path(self.root, known["path"])
-                if digest(old) == known["sha256"]:
-                    old.unlink()
-                    self.clean_parents(old.parent)
-            self.state["files"][key] = {"course": course_id, "path": relative, "stamp": stamp, "sha256": sha256}
-            self.save()
-            self.report(f"Downloaded: {relative}")
-            counts["downloaded"] += 1
+            try:
+                self.file(client, course_id, key, info, relative, counts)
+            except AuthenticationError:
+                raise
+            except (SyncError, OSError) as exc:
+                failed = True
+                counts["errors"] += 1
+                self.report(f"Failed: {relative}: {exc}")
         # Reconcile only after both complete listings and every download succeeded.
+        if failed:
+            return
         for key, entry in list(self.state["files"].items()):
             if entry["course"] == course_id and key not in seen:
                 self.remove(key, counts)
+
+    def file(self, client, course_id, key, info, relative, counts):
+        destination = checked_path(self.root, relative)
+        known = self.state["files"].get(key)
+        current = digest(destination)
+        same_path = known and known["path"] == relative
+        replaced = None
+        if current is not None and not same_path:
+            # The path may hold an unmodified copy of another Canvas file, e.g.
+            # after two files swap names or one is re-uploaded under the same
+            # name. That copy is ours to replace; anything else is the user's.
+            replaced = self.owner(relative, key)
+            if replaced is None or self.state["files"][replaced]["sha256"] != current:
+                self.report(f"Kept existing/local file: {relative}")
+                counts["protected"] += 1
+                return
+        elif current is not None and current != known["sha256"]:
+            self.report(f"Kept existing/local file: {relative}")
+            counts["protected"] += 1
+            return
+        stamp = [info.get("updated_at"), info.get("modified_at"), info.get("size")]
+        if same_path and current is not None and known["stamp"] == stamp:
+            counts["unchanged"] += 1
+            return
+        # Keep a modified old path on a remote rename, and report the conflict.
+        if known and not same_path:
+            old = checked_path(self.root, known["path"])
+            old_hash = digest(old)
+            if old_hash is not None and old_hash != known["sha256"]:
+                self.report(f"Kept local changes: {known['path']}")
+                counts["protected"] += 1
+                return
+        sha256 = self.fetch(client, info, destination, current)
+        if replaced is not None:
+            del self.state["files"][replaced]
+        if known and not same_path:
+            old = checked_path(self.root, known["path"])
+            if digest(old) == known["sha256"]:
+                old.unlink()
+                self.clean_parents(old.parent)
+        self.state["files"][key] = {"course": course_id, "path": relative, "stamp": stamp, "sha256": sha256}
+        self.save()
+        self.report(f"Downloaded: {relative}")
+        counts["downloaded"] += 1
 
     def run(self, client):
         counts = Counter()
