@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canvas-sync"
+version = "1.0.0"
+description = "Automatically mirror Canvas course files to a local folder."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["requests>=2.32.4,<3", "urllib3>=1.26,<3"]
+
+[project.scripts]
+canvas-sync = "canvas_mirror.cli:main"
+
+[tool.setuptools]
+packages = ["canvas_mirror"]
