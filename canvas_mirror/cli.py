@@ -6,7 +6,6 @@ import hashlib
 import os
 from pathlib import Path
 import signal
-import subprocess
 import sys
 import threading
 
@@ -49,45 +48,6 @@ def credentials(metadata, login=False):
     return client, identity, account_path, token
 
 
-def systemd_quote(value, *, command=False):
-    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
-    if command:
-        escaped = escaped.replace("$", "$$")
-    return '"' + escaped + '"'
-
-
-def install_service(root, interval):
-    if sys.platform != "linux":
-        raise SyncError("--background requires Linux with systemd. On macOS, run in a terminal or use a login job.")
-    if any(c in str(root) or c in sys.executable for c in ("\n", "\r")):
-        raise SyncError("Background service paths cannot contain newlines.")
-    name = "canvas-sync-" + hashlib.sha256(str(root).encode()).hexdigest()[:12] + ".service"
-    directory = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
-    directory.mkdir(parents=True, exist_ok=True)
-    command = " ".join(systemd_quote(arg, command=True) for arg in (sys.executable, "-m", "canvas_mirror", str(root), "--interval", str(interval)))
-    working_directory = str(Path(__file__).resolve().parent.parent).replace("%", "%%")
-    content = (
-        "[Unit]\nDescription=Canvas file mirror\n\n[Service]\nType=simple\n"
-        f"ExecStart={command}\nWorkingDirectory={working_directory}\n"
-        "Restart=on-failure\nRestartSec=30\nUMask=0077\nEnvironment=PYTHONUNBUFFERED=1\n"
-        f"Environment={systemd_quote('XDG_CONFIG_HOME=' + str(directory.parent.parent))}\n"
-        "\n[Install]\nWantedBy=default.target\n"
-    )
-    path = directory / name
-    if path.is_symlink():
-        raise SyncError("Refusing to overwrite a service symlink.")
-    path.write_text(content, encoding="utf-8")
-    try:
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, capture_output=True)
-        subprocess.run(["systemctl", "--user", "enable", "--now", name], check=True, capture_output=True)
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise SyncError("Could not start the user service. Check that systemd --user is available, or run without --background.") from exc
-    print(f"Automatic sync enabled for {root} (every {interval} seconds while logged in).")
-    print(f"Status: systemctl --user status {name}")
-    print(f"Logs: journalctl --user -u {name}")
-    print(f"Stop and disable: systemctl --user disable --now {name}")
-
-
 def positive_interval(value):
     try:
         number = int(value)
@@ -101,9 +61,7 @@ def positive_interval(value):
 def parser():
     result = argparse.ArgumentParser(prog="canvas-sync", description="Automatically mirror Canvas course files to a normal folder.")
     result.add_argument("folder", type=Path, help="destination folder (created if needed)")
-    mode = result.add_mutually_exclusive_group()
-    mode.add_argument("--once", action="store_true", help="sync once and exit")
-    mode.add_argument("--background", action="store_true", help="install and start a Linux user service")
+    result.add_argument("--once", action="store_true", help="sync once and exit")
     result.add_argument("--interval", type=positive_interval, default=300, metavar="SECONDS", help="time between syncs (default: 300; minimum: 30)")
     result.add_argument("--login", action="store_true", help="prompt for a replacement access token")
     return result
@@ -132,31 +90,27 @@ def main(argv=None):
         with mirror_lock(root) as metadata:
             client, identity, account_path, token = credentials(metadata, args.login)
             mirror = Mirror(root, metadata, identity)
-            # Bind the folder before saving credentials or starting its service.
+            # Bind the folder before saving credentials.
             mirror.save()
             atomic_json(checked_path(root, ".canvas-sync/config.json"), {"url": identity["url"]})
-            if args.background or args.login or not os.environ.get("CANVAS_TOKEN"):
+            if args.login or not os.environ.get("CANVAS_TOKEN"):
                 atomic_json(account_path, {"token": token})
-            if not args.background:
-                for signum in (signal.SIGINT, signal.SIGTERM):
-                    previous[signum] = signal.signal(signum, stop)
-                print(f"Mirroring to {root}", flush=True)
-                while True:
-                    try:
-                        counts = mirror.run(client)
-                        if args.once:
-                            return 1 if counts["errors"] or counts["protected"] else 0
-                    except AuthenticationError:
-                        raise
-                    except (SyncError, OSError) as exc:
-                        print(f"Sync failed: {exc}", file=sys.stderr, flush=True)
-                        if args.once:
-                            return 1
-                    print(f"Next sync in {args.interval} seconds. Ctrl+C to stop.", flush=True)
-                    pause.wait(args.interval)
-        # The child must be able to acquire the mirror lock immediately.
-        install_service(root, args.interval)
-        return 0
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous[signum] = signal.signal(signum, stop)
+            print(f"Mirroring to {root}", flush=True)
+            while True:
+                try:
+                    counts = mirror.run(client)
+                    if args.once:
+                        return 1 if counts["errors"] or counts["protected"] else 0
+                except AuthenticationError:
+                    raise
+                except (SyncError, OSError) as exc:
+                    print(f"Sync failed: {exc}", file=sys.stderr, flush=True)
+                    if args.once:
+                        return 1
+                print(f"Next sync in {args.interval} seconds. Ctrl+C to stop.", flush=True)
+                pause.wait(args.interval)
     except (SyncError, OSError, EOFError) as exc:
         print(f"canvas-sync: {exc}", file=sys.stderr)
         return 1

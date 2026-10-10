@@ -2,7 +2,7 @@
 
 Mirror your Canvas course files into any normal folder. Enter your Canvas URL and access token once; Canvas Sync downloads the files and checks for changes every five minutes.
 
-Requires Python 3.10+ on Linux or macOS. Background service installation requires Linux with systemd.
+Requires Python 3.10+ on Linux or macOS.
 
 ## Start
 
@@ -27,20 +27,6 @@ The first run asks for:
 
 Leave the command running to keep syncing. Press Ctrl+C to stop. Files remain available offline.
 
-## Run automatically in the background
-
-On Linux:
-
-```sh
-.venv/bin/canvas-sync ~/Canvas --background
-```
-
-This sets up a systemd user service, starts it immediately, and enables it for future logins. You can close the terminal. It prints commands to view status, read logs, and stop/disable the service. Keep the installation's virtual environment in place. The service runs while your user session is active; running after logout requires systemd lingering configured separately.
-
-If you already have a foreground sync running for that folder, stop it first. To change the interval of an existing service, stop/disable it using the printed command, then rerun setup with the new interval.
-
-On macOS, the foreground command works; automatic login service installation is not included.
-
 ## Options
 
 ```sh
@@ -51,7 +37,7 @@ canvas-sync ~/Canvas --login         # replace an expired token
 
 These examples assume your virtual environment is activated (`source .venv/bin/activate`); otherwise use `.venv/bin/canvas-sync`.
 
-For unattended setup, supply `CANVAS_URL` and `CANVAS_TOKEN` as environment variables. Avoid putting tokens in shell history. Environment tokens are not saved unless `--background` or `--login` is used. Tokens are stored separately from downloaded files under `$XDG_CONFIG_HOME/canvas-sync/accounts/` (default `~/.config/canvas-sync/accounts/`) in files readable only by your user (`0600`). They are stored as plaintext, not in an OS keychain. One saved token is used per Canvas site.
+For unattended setup, supply `CANVAS_URL` and `CANVAS_TOKEN` as environment variables. Avoid putting tokens in shell history. Environment tokens are not saved unless `--login` is used. Tokens are stored separately from downloaded files under `$XDG_CONFIG_HOME/canvas-sync/accounts/` (default `~/.config/canvas-sync/accounts/`) in files readable only by your user (`0600`). They are stored as plaintext, not in an OS keychain. One saved token is used per Canvas site.
 
 ## Mirror behavior
 
@@ -64,7 +50,7 @@ For unattended setup, supply `CANVAS_URL` and `CANVAS_TOKEN` as environment vari
 - Keeps tracking data in `.canvas-sync/` inside each destination. Keep that directory with the files when moving the mirror. Each destination belongs to one Canvas account.
 - Never uploads local edits. Pages, announcements, quizzes, submissions, personal/group storage, and external links are outside its scope. Empty Canvas folders are not materialized until they contain files.
 
-`--once` returns `0` on success, `1` for errors or protected-file conflicts, and `2` for invalid arguments. Continuous mode retries failed sync passes at the configured interval. An expired token stops the process with an instruction to use `--login`. Stop a background service before replacing its credentials, then enable it again.
+`--once` returns `0` on success, `1` for errors or protected-file conflicts, and `2` for invalid arguments. Continuous mode retries failed sync passes at the configured interval. An expired token stops the process with an instruction to use `--login`.
 
 Avoid placing the destination inside this source repository or changing its files through another synchronization tool at the same time.
 

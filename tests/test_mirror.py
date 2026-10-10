@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from canvas_mirror.api import AuthenticationError, Client, SyncError, UnavailableError, normalize_url
-from canvas_mirror.cli import Stopped, main, install_service
+from canvas_mirror.cli import Stopped, main
 from canvas_mirror.storage import mirror_lock
 from canvas_mirror.sync import Mirror
 
@@ -393,17 +393,6 @@ class CliTests(unittest.TestCase):
             self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)
             client.close.assert_called_once()
 
-    def test_background_releases_lock_before_starting_service(self):
-        with tempfile.TemporaryDirectory() as temp:
-            client = Mock()
-            client.one.return_value = {"id": 1}
-            def start(root, interval):
-                with mirror_lock(root):
-                    pass
-            with patch.dict(os.environ, {"XDG_CONFIG_HOME": temp, "CANVAS_URL": "https://canvas.example", "CANVAS_TOKEN": "test"}, clear=True), patch("canvas_mirror.cli.Client", return_value=client), patch("canvas_mirror.cli.install_service", side_effect=start) as service:
-                self.assertEqual(main([str(Path(temp) / "mirror"), "--background"]), 0)
-                service.assert_called_once()
-
     def test_prompt_validate_persist_and_reuse(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "mirror"
@@ -425,18 +414,6 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {}, clear=True), patch("sys.stdin.isatty", return_value=False), patch("sys.stderr", new_callable=io.StringIO) as error:
             self.assertEqual(main([temp, "--once"]), 1)
             self.assertIn("terminal", error.getvalue())
-
-    def test_service_uses_argument_array_and_quotes_folder(self):
-        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"XDG_CONFIG_HOME": temp}), patch("sys.platform", "linux"), patch("subprocess.run") as run, patch("sys.stdout", new_callable=io.StringIO):
-            install_service(Path(temp) / 'my folder % $ "', 300)
-            service = next(Path(temp).rglob("*.service")).read_text()
-            self.assertIn("%%", service)
-            self.assertIn("$$", service)
-            self.assertIn('\\"', service)
-            self.assertIn("WorkingDirectory=/", service)
-            self.assertEqual(run.call_count, 2)
-            self.assertIsInstance(run.call_args.args[0], list)
-            self.assertNotIn("token", service)
 
 
 if __name__ == "__main__":
